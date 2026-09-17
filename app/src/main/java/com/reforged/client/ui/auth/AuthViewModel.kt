@@ -1,0 +1,297 @@
+package com.reforged.client.ui.auth
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.reforged.client.data.local.TokenStorage
+import com.reforged.client.data.remote.*
+import com.reforged.client.data.repository.AuthRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+sealed class AuthState {
+    object Idle : AuthState()
+    object Loading : AuthState()
+    data class Success(val token: String) : AuthState()
+    data class SelectValidationMethod(val sid: String, val methods: List<VerificationMethod>) : AuthState()
+    data class CodeValidation(val sid: String, val method: String, val info: String? = null) : AuthState()
+    data class NeedPassword(val sid: String, val canSkip: Boolean = false) : AuthState()
+    data class NeedCaptcha(val sid: String, val imgUrl: String, val redirectUri: String? = null) : AuthState()
+    data class Need2FA(val sid: String, val phoneMask: String) : AuthState()
+    data class Error(val message: String) : AuthState()
+}
+
+@HiltViewModel
+class AuthViewModel @Inject constructor(
+    private val repository: AuthRepository,
+    private val tokenStorage: TokenStorage
+) : ViewModel() {
+
+    private val _isAuthorized = MutableStateFlow(tokenStorage.accessToken != null)
+    val isAuthorized: StateFlow<Boolean> = _isAuthorized
+
+    private val _authState = MutableStateFlow<AuthState>(AuthState.Idle)
+    val authState: StateFlow<AuthState> = _authState
+
+    private var currentUsername = ""
+    private var currentSid = ""
+    private var currentMethod = ""
+    private var currentPassword = ""
+    private var current2FACode = ""
+    private var currentGrantType = "without_password"
+    private var canSkipPassword = false
+
+    fun startLogin(username: String, captchaToken: String? = null) {
+        currentUsername = username
+        android.util.Log.d("AuthViewModel", "startLogin: $username, captchaToken: ${captchaToken != null}")
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            repository.validateAccount(username, captchaToken).onSuccess { validation ->
+                if (validation.error != null) {
+                    val error = validation.error
+                    if (error.error_code == 14) {
+                        _authState.value = AuthState.NeedCaptcha(
+                            sid = error.captcha_sid ?: "",
+                            imgUrl = error.captcha_img ?: "",
+                            redirectUri = error.redirect_uri
+                        )
+                        return@onSuccess
+                    }
+                    _authState.value = AuthState.Error(error.error_msg ?: "Validation failed")
+                    return@onSuccess
+                }
+                
+                currentSid = validation.sid ?: ""
+                val nextStep = validation.next_step
+                
+                when {
+                    validation.flow_name == "need_registration" -> {
+                        _authState.value = AuthState.Error("Account not registered")
+                    }
+                    nextStep == null || nextStep.verification_method == "password" -> {
+                        currentMethod = "password"
+                        _authState.value = AuthState.NeedPassword(currentSid)
+                    }
+                    else -> {
+                        // Get methods
+                        repository.getVerificationMethods(currentSid).onSuccess { methods ->
+                            if (methods.isEmpty()) {
+                                // Fallback to nextStep method
+                                currentMethod = nextStep.verification_method ?: ""
+                                sendOtp(currentSid, currentMethod)
+                            } else if (methods.size == 1 && !nextStep.has_another_verification_methods) {
+                                currentMethod = methods[0].name
+                                sendOtp(currentSid, currentMethod)
+                            } else {
+                                _authState.value = AuthState.SelectValidationMethod(currentSid, methods)
+                            }
+                        }.onFailure {
+                            // Fallback
+                            currentMethod = nextStep.verification_method ?: ""
+                            sendOtp(currentSid, currentMethod)
+                        }
+                    }
+                }
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "Validation failed")
+            }
+        }
+    }
+
+    fun selectMethod(sid: String, method: String) {
+        currentSid = sid
+        currentMethod = method
+        sendOtp(sid, method)
+    }
+
+    private fun sendOtp(sid: String, method: String) {
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            repository.sendEcosystemOtp(sid, method, currentUsername).onSuccess { response ->
+                currentSid = response.sid ?: currentSid
+                _authState.value = AuthState.CodeValidation(currentSid, method, response.info)
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "Failed to send code")
+            }
+        }
+    }
+
+    fun verifyCode(code: String) {
+        current2FACode = code
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            repository.checkEcosystemOtp(currentSid, currentMethod, code).onSuccess { response ->
+                currentSid = response.sid ?: currentSid
+                canSkipPassword = response.can_skip_password
+                
+                if (canSkipPassword) {
+                    doAuth(grantType = "without_password")
+                } else {
+                    _authState.value = AuthState.NeedPassword(currentSid, canSkip = false)
+                }
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "Code verification failed")
+            }
+        }
+    }
+
+    fun loginWithPassword(password: String) {
+        currentPassword = password
+        doAuth(password = password, grantType = "password")
+    }
+
+    fun submitCaptcha(captchaKey: String) {
+        // Simple captcha
+        doAuth(grantType = if (currentMethod == "password") "password" else "without_password")
+    }
+
+    fun onCaptchaSuccess(successToken: String) {
+        android.util.Log.d("AuthViewModel", "onCaptchaSuccess, currentSid: $currentSid, grantType: $currentGrantType")
+        if (currentSid.isEmpty()) {
+            // Captcha was during validateAccount
+            startLogin(currentUsername, successToken)
+        } else {
+            // Captcha was during directLogin (Password or 2FA)
+            doAuth(
+                password = if (currentPassword.isNotEmpty()) currentPassword else null,
+                code = if (current2FACode.isNotEmpty()) current2FACode else null,
+                grantType = currentGrantType,
+                captchaSuccessToken = successToken
+            )
+        }
+    }
+
+    fun submit2FA(code: String) {
+        current2FACode = code
+        val currentState = authState.value
+        if (currentState is AuthState.Need2FA) {
+            // When submitting 2FA code, use the SID from the error response
+            doAuth(sid = currentState.sid, code = code, grantType = currentGrantType)
+        }
+    }
+
+    private fun doAuth(
+        password: String? = null,
+        sid: String? = currentSid,
+        code: String? = null,
+        grantType: String,
+        captchaSuccessToken: String? = null
+    ) {
+        currentGrantType = grantType
+        // If we have a code, we usually don't need to send the password again
+        // as the SID already represents the validated credentials session.
+        val passwordToUse = if (code != null) null else password ?: if (currentPassword.isNotEmpty()) currentPassword else null
+        
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            repository.directLogin(
+                username = currentUsername,
+                password = passwordToUse,
+                sid = sid,
+                code = code,
+                grantType = grantType,
+                captchaSuccessToken = captchaSuccessToken
+            ).onSuccess { response ->
+                handleLoginResponse(response)
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "Auth failed")
+            }
+        }
+    }
+
+    private fun handleLoginResponse(response: LoginResponse) {
+        // Update SID if provided by VK in error or success
+        response.validation_sid?.let { currentSid = it }
+        response.captcha_sid?.let { currentSid = it }
+
+        when {
+            response.access_token != null -> {
+                val token = response.access_token
+                val userId = response.user_id ?: 0L
+                tokenStorage.accessToken = token
+                tokenStorage.userId = userId
+                
+                com.google.firebase.crashlytics.FirebaseCrashlytics.getInstance().setUserId(userId.toString())
+                
+                // Exchange token warming
+                viewModelScope.launch {
+                    repository.refreshAndWarmToken(token).onSuccess { musicToken ->
+                        tokenStorage.musicAccessToken = musicToken
+                    }
+                }
+
+                _isAuthorized.value = true
+                _authState.value = AuthState.Success(token)
+            }
+            response.error == "need_captcha" -> {
+                _authState.value = AuthState.NeedCaptcha(
+                    sid = response.validation_sid ?: response.captcha_sid ?: currentSid,
+                    imgUrl = response.captcha_img ?: "",
+                    redirectUri = response.redirect_uri
+                )
+            }
+            response.error == "need_validation" -> {
+                // Check if it's 2FA or Web Validation
+                if (response.validation_type == "2fa" || response.validation_type == "phone" || response.validation_type == "2fa_app" || response.validation_type == "2fa_sms") {
+                    val sid2fa = response.validation_sid ?: currentSid
+                    _authState.value = AuthState.Need2FA(sid2fa, response.phone_mask ?: "")
+                } else if (!response.captcha_img.isNullOrEmpty()) {
+                    _authState.value = AuthState.NeedCaptcha(
+                        sid = response.validation_sid ?: currentSid,
+                        imgUrl = response.captcha_img!!,
+                        redirectUri = response.redirect_uri
+                    )
+                } else {
+                    _authState.value = AuthState.Error(response.error_description ?: "Validation required")
+                }
+            }
+            else -> {
+                _authState.value = AuthState.Error(response.error_description ?: "Login failed")
+            }
+        }
+    }
+
+    fun login(username: String, password: String, captchaKey: String? = null, code: String? = null) {
+        currentUsername = username
+        
+        viewModelScope.launch {
+            _authState.value = AuthState.Loading
+            
+            // Using captchaKey indirectly via currentSid/sidToUse logic if needed
+            val sidToUse = if (captchaKey != null) currentSid else currentSid
+            
+            repository.directLogin(
+                username = username,
+                password = password,
+                sid = sidToUse,
+                code = code,
+                grantType = if (password.isNotEmpty()) "password" else "without_password"
+            ).onSuccess { response ->
+                handleLoginResponse(response)
+            }.onFailure { error ->
+                _authState.value = AuthState.Error(error.message ?: "Login failed")
+            }
+        }
+    }
+
+    fun logout() {
+        tokenStorage.accessToken = null
+        tokenStorage.musicAccessToken = null
+        tokenStorage.userId = 0L
+        _isAuthorized.value = false
+        _authState.value = AuthState.Idle
+    }
+
+    fun onTokenCaptured(token: String, uId: Long) {
+        viewModelScope.launch {
+            tokenStorage.accessToken = token
+            tokenStorage.userId = uId
+            
+            com.google.firebase.crashlytics.FirebaseCrashlytics.getInstance().setUserId(uId.toString())
+            _authState.value = AuthState.Success(token)
+            _isAuthorized.value = true
+        }
+    }
+}
