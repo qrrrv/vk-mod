@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "587982472533",
+    "project_id": "vk-mod-88250",
+    "storage_bucket": "vk-mod-88250.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:587982472533:android:43c2b582f15568aa4bdbdc",
+        "android_client_info": {
+          "package_name": "com.reforged.client"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDhebyfX1mzPnAPTFhYDz2k2zvH-qMyag4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
